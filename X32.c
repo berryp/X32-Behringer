@@ -37,6 +37,8 @@
 // 0.86: Fixed missing comma in XiQeq[] definitions
 // 0.87: Partial fix for /meters command
 // 0.88: Fix for /meters/5 and /meter/6 timefactor control
+// 0.89: X-USB card emulation: audio engine streaming card inputs/outputs to the X32 virtual
+//       audio driver for macOS (see X32AudioEngine.c and X32USBDriver/), live /meters/0..2
 //
 #ifdef __WIN32__
 #include <windows.h>
@@ -65,6 +67,10 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
+#ifndef __WIN32__
+#include "X32AudioEngine.h"
+#include "X32AudioProtocol.h"
+#endif
 
 #define EPSILON 0.0001	// epsilon for float comparisons
 #define XVERSION "4.06"	// FW version
@@ -309,6 +315,10 @@ int function_node_single();
 void GetFxPar1(X32command* command, char* buf, int ipar, int type);
 void SetFxPar1(X32command* command, char* str_pt_in, int ipar, int type);
 void Xprepmeter(int i, int l, char *buf, int n, int k);
+void X32AudioDefaults();
+#ifndef __WIN32__
+void X32AudioBind(X32AudioParams* p);
+#endif
 
 char snode_str[32]; // used to temporarily save a string in node and FX commands
 char*	OffOn[] = {" OFF", " ON", ""};
@@ -869,13 +879,18 @@ socklen_t Client_ip_len = sizeof(Client_ip);	// length of addresses
 int main(int argc, char **argv) {
 	int i, whoto, noIP;
 	int input_intch;
+#ifndef __WIN32__
+	int audio_port = X32A_DEFAULT_PORT;
+	int audio_signal = X32AE_SIG_SILENCE;
+	X32AudioParams audio_params;
+#endif
 	struct addrinfo hints;
 	struct addrinfo *result, *rp;
 //
 // Manage arguments
 	fflush(stdout);
 	noIP = 1;
-	while ((input_intch = getopt(argc, argv, "i:d:v:x:b:f:r:m:h")) != -1) {
+	while ((input_intch = getopt(argc, argv, "i:d:v:x:b:f:r:m:a:s:h")) != -1) {
 		switch ((char)input_intch) {
 		case 'i':
 			strcpy(Xip_str, optarg );
@@ -902,6 +917,14 @@ int main(int argc, char **argv) {
 		case 'm':
 			sscanf(optarg, "%d", &X_meter);
 			break;
+#ifndef __WIN32__
+		case 'a':
+			sscanf(optarg, "%d", &audio_port);
+			break;
+		case 's':
+			sscanf(optarg, "%d", &audio_signal);
+			break;
+#endif
 		default:
 		case 'h':
 			printf("usage: X32 [-i <IP address>] - default: first IP available on system\n");
@@ -912,7 +935,12 @@ int main(int argc, char **argv) {
 			printf("     [-b 0/1, echoes incoming verbose for /batchsubscribe] - default: 0\n");
 			printf("     [-f 0/1, echoes incoming verbose for /formatsubscribe] - default: 0\n");
 			printf("     [-r 0/1, echoes incoming verbose for /renew] - default: 0\n");
-			printf("     [-m 0/1, echoes incoming verbose for /meters] - default: 0\n\n");
+			printf("     [-m 0/1, echoes incoming verbose for /meters] - default: 0\n");
+#ifndef __WIN32__
+			printf(" [-a <port>, UDP port for the X-USB virtual audio driver, 0: no audio] - default: %d\n", X32A_DEFAULT_PORT);
+			printf(" [-s 0/1/2, signal on local inputs AN1-32: 0: silence, 1: tones, 2: noise] - default: 0\n");
+#endif
+			printf("\n");
 			printf(" The (non-Behringer) command \"/shutdown\" will save data and quit\n");
 			return (0);
 			break;
@@ -943,7 +971,7 @@ int main(int argc, char **argv) {
 #endif
 //
 	r_len = 0;
-	printf("X32 - v0.88 - An X32 Emulator - (c)2014-2019 Patrick-Gilles Maillot\n");
+	printf("X32 - v0.89 - An X32 Emulator - (c)2014-2019 Patrick-Gilles Maillot\n");
 	//
 	// Get or use IP address
 	if (noIP) {
@@ -989,7 +1017,17 @@ int main(int argc, char **argv) {
 				break;
 			}
 		}
+		X32AudioDefaults();
 	}
+#ifndef __WIN32__
+	// Start the X-USB card audio engine (talks to the X32 virtual audio driver)
+	if (audio_port > 0) {
+		X32AudioBind(&audio_params);
+		if (X32AudioStart(&audio_params, audio_port, audio_signal, Xverbose) == 0) {
+			printf("X-USB audio: waiting for the virtual audio driver on UDP port %d\n", audio_port);
+		}
+	}
+#endif
 	// Wait for messages from client, with non blocking socket
 	timeout.tv_sec = 0;
 	timeout.tv_usec = 10000; //Set timeout for non blocking recvfrom(): 10ms
@@ -1067,6 +1105,10 @@ int main(int argc, char **argv) {
 					if (XActiveMeters & (1 << i)) {
 						if(timercmp(&XTimerMeters[i], &xmeter_time, > )) {
 							if(timercmp(&xmeter_time, &XInterMeters[i], > )) {
+#ifndef __WIN32__
+								// live levels from the audio engine (blob floats start at byte 24)
+								X32AudioMeters(i, (unsigned char*)&Xbuf_meters[i][24], (Lbuf_meters[i] - 24) / 4);
+#endif
 								if (sendto(Xfd, &Xbuf_meters[i][0], Lbuf_meters[i], 0, &XClientMeters[i], Client_ip_len) < 0) {
 									perror("Error while sending data");
 									return(0);
@@ -1081,6 +1123,9 @@ int main(int argc, char **argv) {
 			}
 //		}
 	}
+#ifndef __WIN32__
+	X32AudioStop();
+#endif
 	return 0;
 }
 
@@ -5659,3 +5704,167 @@ int X32Init() {
 	fflush(stdout);
 	return 0;
 }
+
+//
+// X-USB card audio support
+//
+// find a command in a command table
+static X32command* Xfind(X32command* Xarray, int max, char* name) {
+	int i;
+	for (i = 0; i < max; i++) {
+		if (strcmp(Xarray[i].command, name) == 0) return &Xarray[i];
+	}
+	return NULL;
+}
+#define Xset_i(arr, max, name, v)	if ((Xc = Xfind(arr, max, name)) != NULL) Xc->value.ii = (v)
+#define Xset_f(arr, max, name, v)	if ((Xc = Xfind(arr, max, name)) != NULL) Xc->value.ff = (v)
+//
+// Factory defaults for the parameters that matter to audio (no resource file yet):
+// channel n gets input n, local inputs feed inputs 1-32 and the card outputs (as on
+// a real X32), the card inputs are the "PLAY" routing source, channels and buses are
+// unmuted, outputs 1-2 are Main L/R, the card is an X-USB card.
+void X32AudioDefaults() {
+	int i, j, max;
+	char name[64];
+	X32command* Xc;
+	static char* blocks[] = {"1-8", "9-16", "17-24", "25-32"};
+
+	for (i = 0; i < 4; i++) {
+		sprintf(name, "/config/routing/IN/%s", blocks[i]);
+		Xset_i(Xconfig, Xconfig_max, name, i);			// AN1-8 ... AN25-32
+		sprintf(name, "/config/routing/CARD/%s", blocks[i]);
+		Xset_i(Xconfig, Xconfig_max, name, i);			// AN1-8 ... AN25-32
+		sprintf(name, "/config/routing/PLAY/%s", blocks[i]);
+		Xset_i(Xconfig, Xconfig_max, name, 16 + i);		// CARD1-8 ... CARD25-32
+	}
+	for (i = 0; i < 32; i++) {
+		max = i ? Xchannel02_max : Xchannel01_max;
+		sprintf(name, "/ch/%02d/config/source", i + 1);
+		Xset_i(Xchannelset[i], max, name, i + 1);
+		sprintf(name, "/ch/%02d/preamp/trim", i + 1);
+		Xset_f(Xchannelset[i], max, name, 0.5);
+		sprintf(name, "/ch/%02d/mix/on", i + 1);
+		Xset_i(Xchannelset[i], max, name, 1);
+		sprintf(name, "/ch/%02d/mix/st", i + 1);
+		Xset_i(Xchannelset[i], max, name, 1);
+		sprintf(name, "/ch/%02d/mix/pan", i + 1);
+		Xset_f(Xchannelset[i], max, name, 0.5);
+		for (j = 0; j < 16; j++) {
+			sprintf(name, "/ch/%02d/mix/%02d/on", i + 1, j + 1);
+			Xset_i(Xchannelset[i], max, name, 1);
+			sprintf(name, "/ch/%02d/mix/%02d/type", i + 1, j + 1);
+			Xset_i(Xchannelset[i], max, name, 4);		// POST
+		}
+	}
+	for (i = 0; i < 16; i++) {
+		max = i ? Xbus02_max : Xbus01_max;
+		sprintf(name, "/bus/%02d/mix/on", i + 1);
+		Xset_i(Xbusset[i], max, name, 1);
+		sprintf(name, "/bus/%02d/mix/pan", i + 1);
+		Xset_f(Xbusset[i], max, name, 0.5);
+	}
+	for (i = 0; i < 8; i++) {
+		sprintf(name, "/dca/%d/on", i + 1);
+		Xset_i(Xdca, Xdca_max, name, 1);
+		sprintf(name, "/dca/%d/fader", i + 1);
+		Xset_f(Xdca, Xdca_max, name, 0.75);				// 0dB
+	}
+	Xset_i(Xmain, Xmain_max, "/main/st/mix/on", 1);
+	Xset_f(Xmain, Xmain_max, "/main/st/mix/pan", 0.5);
+	Xset_i(Xmain, Xmain_max, "/main/m/mix/on", 1);
+	Xset_i(Xoutput, Xoutput_max, "/outputs/main/01/src", 1);	// Main L
+	Xset_i(Xoutput, Xoutput_max, "/outputs/main/02/src", 2);	// Main R
+	Xset_i(Xprefs, Xprefs_max, "/-prefs/card/UFifc", 1);		// USB
+}
+
+#ifndef __WIN32__
+#define Xbind_i(dst, arr, max, name)	if ((Xc = Xfind(arr, max, name)) != NULL) dst = &Xc->value.ii
+#define Xbind_f(dst, arr, max, name)	if ((Xc = Xfind(arr, max, name)) != NULL) dst = &Xc->value.ff
+//
+// Point the audio engine at the parameter values it uses
+void X32AudioBind(X32AudioParams* p) {
+	int i, j, max;
+	char name[64];
+	X32command* Xc;
+	X32command* Xa;
+	static char* blocks[] = {"1-8", "9-16", "17-24", "25-32"};
+
+	memset(p, 0, sizeof(X32AudioParams));
+	Xbind_i(p->routswitch, Xconfig, Xconfig_max, "/config/routing/routswitch");
+	for (i = 0; i < 4; i++) {
+		sprintf(name, "/config/routing/IN/%s", blocks[i]);
+		Xbind_i(p->rt_in[i], Xconfig, Xconfig_max, name);
+		sprintf(name, "/config/routing/PLAY/%s", blocks[i]);
+		Xbind_i(p->rt_play[i], Xconfig, Xconfig_max, name);
+		sprintf(name, "/config/routing/CARD/%s", blocks[i]);
+		Xbind_i(p->rt_card[i], Xconfig, Xconfig_max, name);
+	}
+	for (i = 0; i < X32AE_NMGRP; i++) {
+		sprintf(name, "/config/mute/%d", i + 1);
+		Xbind_i(p->mute_grp[i], Xconfig, Xconfig_max, name);
+	}
+	for (i = 0; i < X32AE_NCH; i++) {
+		Xa = Xchannelset[i];
+		max = i ? Xchannel02_max : Xchannel01_max;
+#define CH_I(field, path) sprintf(name, "/ch/%02d/" path, i + 1); Xbind_i(p->ch[i].field, Xa, max, name)
+#define CH_F(field, path) sprintf(name, "/ch/%02d/" path, i + 1); Xbind_f(p->ch[i].field, Xa, max, name)
+		CH_I(source, "config/source");
+		CH_I(dca, "grp/dca");
+		CH_I(mute, "grp/mute");
+		CH_F(trim, "preamp/trim");
+		CH_I(invert, "preamp/invert");
+		CH_I(on, "mix/on");
+		CH_F(fader, "mix/fader");
+		CH_I(st, "mix/st");
+		CH_F(pan, "mix/pan");
+		CH_I(mono, "mix/mono");
+		CH_F(mlevel, "mix/mlevel");
+		for (j = 0; j < X32AE_NBUS; j++) {
+			sprintf(name, "/ch/%02d/mix/%02d/on", i + 1, j + 1);
+			Xbind_i(p->ch[i].send_on[j], Xa, max, name);
+			sprintf(name, "/ch/%02d/mix/%02d/level", i + 1, j + 1);
+			Xbind_f(p->ch[i].send_level[j], Xa, max, name);
+			sprintf(name, "/ch/%02d/mix/%02d/type", i + 1, (j & ~1) + 1);	// odd send of the pair
+			Xbind_i(p->ch[i].send_type[j], Xa, max, name);
+		}
+#undef CH_I
+#undef CH_F
+	}
+	for (i = 0; i < X32AE_NBUS; i++) {
+		Xa = Xbusset[i];
+		max = i ? Xbus02_max : Xbus01_max;
+		sprintf(name, "/bus/%02d/mix/on", i + 1);
+		Xbind_i(p->bus[i].on, Xa, max, name);
+		sprintf(name, "/bus/%02d/mix/fader", i + 1);
+		Xbind_f(p->bus[i].fader, Xa, max, name);
+		sprintf(name, "/bus/%02d/mix/st", i + 1);
+		Xbind_i(p->bus[i].st, Xa, max, name);
+		sprintf(name, "/bus/%02d/mix/pan", i + 1);
+		Xbind_f(p->bus[i].pan, Xa, max, name);
+		sprintf(name, "/bus/%02d/mix/mono", i + 1);
+		Xbind_i(p->bus[i].mono, Xa, max, name);
+		sprintf(name, "/bus/%02d/mix/mlevel", i + 1);
+		Xbind_f(p->bus[i].mlevel, Xa, max, name);
+	}
+	for (i = 0; i < X32AE_NDCA; i++) {
+		sprintf(name, "/dca/%d/on", i + 1);
+		Xbind_i(p->dca_on[i], Xdca, Xdca_max, name);
+		sprintf(name, "/dca/%d/fader", i + 1);
+		Xbind_f(p->dca_fader[i], Xdca, Xdca_max, name);
+	}
+	Xbind_i(p->main_on, Xmain, Xmain_max, "/main/st/mix/on");
+	Xbind_f(p->main_fader, Xmain, Xmain_max, "/main/st/mix/fader");
+	Xbind_f(p->main_pan, Xmain, Xmain_max, "/main/st/mix/pan");
+	Xbind_i(p->mono_on, Xmain, Xmain_max, "/main/m/mix/on");
+	Xbind_f(p->mono_fader, Xmain, Xmain_max, "/main/m/mix/fader");
+	for (i = 0; i < X32AE_NOUT; i++) {
+		sprintf(name, "/outputs/main/%02d/src", i + 1);
+		Xbind_i(p->out_src[i], Xoutput, Xoutput_max, name);
+		sprintf(name, "/outputs/main/%02d/pos", i + 1);
+		Xbind_i(p->out_pos[i], Xoutput, Xoutput_max, name);
+	}
+	Xbind_i(p->clockrate, Xprefs, Xprefs_max, "/-prefs/clockrate");
+	Xbind_i(p->usbmode, Xprefs, Xprefs_max, "/-prefs/card/USBmode");
+	if ((Xc = Xfind(Xprefs, Xprefs_max, "/-prefs/name")) != NULL) p->name = &Xc->value.str;
+}
+#endif

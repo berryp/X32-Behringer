@@ -52,7 +52,7 @@ X32Xlive_Wav: X32lib
 	$(CC) $(CFLAGS) -o $(BUILD)/$@ $@.c $(LDFLAGS)
 
 X32: X32lib
-	$(CC) $(CFLAGS) -o $(BUILD)/$@ $@.c $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $(BUILD)/$@ $@.c X32AudioEngine.c $(LDFLAGS) -lpthread
 
 X32SetScene: X32lib
 	$(CC) $(CFLAGS) -o $(BUILD)/$@ $@.c $(LDFLAGS) SetSceneParse.c fxparse1.c fxparse5.c fxparse.c

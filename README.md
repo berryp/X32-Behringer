@@ -284,9 +284,14 @@ usage: X32 [-d 0/1, debug option] -default: 0
            [-f 0/1, echoes incoming verbose for /formatsubscribe] -default: 0
            [-r 0/1, echoes incoming verbose for /renew] -default: 0
            [-m 0/1, echoes incoming verbose for /meters] -default: 0
+           [-a <port>, UDP port for the X-USB virtual audio driver, 0: no audio] -default: 10025
+           [-s 0/1/2, signal on local inputs AN1-32: 0: silence, 1: tones, 2: noise] -default: 0
 
    The (non-Behringer) command "/shutdown" will save data and quit
 ```
+
+#### Using the emulator as an audio interface (macOS) ####
+Since v0.89 the emulator has an X-USB expansion card: together with the virtual audio driver in [X32USBDriver](X32USBDriver/README.md), it shows up on a Mac as a 32 in / 32 out audio device named "X32 Emulator", like a real X32 with an X-USB card. Audio the Mac plays arrives on the card inputs (CARD1-32 in the input routing), and the Mac records the card outputs (/config/routing/CARD). A small audio engine handles routing, faders, mutes, DCAs, mix buses, Main LR and the output patches, and sends live levels to /meters/0, 1 and 2. It does not emulate EQ, dynamics or FX. See [X32USBDriver/README.md](X32USBDriver/README.md) to build and install the driver.
 
 
 In the above example of use, the following commands were sent from an X32_Command window (the -> lines show dialog data going to and from the X32 emulator):
